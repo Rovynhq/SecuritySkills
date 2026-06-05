@@ -13,7 +13,7 @@ phase: [respond]
 frameworks: [NIST-SP-800-86, RFC-3227]
 difficulty: advanced
 time_estimate: "30-60min"
-version: "1.0.0"
+version: "1.0.1"
 author: unitoneai
 license: MIT
 allowed-tools: Read, Grep, Glob
@@ -118,6 +118,25 @@ RFC 3227 Section 2.1 defines the order of volatility -- evidence sources ranked 
 ### Step 3: Volatile Data Capture
 
 Capture volatile data BEFORE any containment action that would alter system state (network isolation may be acceptable; reboot, shutdown, or reimaging destroys volatile evidence).
+
+#### 3.0 Pre-Containment Volatile Evidence Decision Gate
+
+Before any destructive containment action such as terminating an instance, deleting a pod, isolating a VM through a snapshot-and-rebuild workflow, or reimaging a host, record whether volatile evidence was captured, intentionally skipped, or unavailable.
+
+**Volatile evidence decision record:**
+
+| Planned Containment Action | Memory Captured | Network Connections Captured | Process Tree Captured | Volatile Evidence Deferred? | Reason | Approved By |
+|----------------------------|-----------------|------------------------------|-----------------------|-----------------------------|--------|-------------|
+| terminate instance | Yes/No | Yes/No | Yes/No | Yes/No | [operational reason or evidence gap] | [name / role] |
+
+**What to verify before containment:**
+
+- [ ] The responder records whether memory capture was completed, skipped, or impossible.
+- [ ] Active network connections, listening ports, and process state are captured or explicitly waived.
+- [ ] Any decision to skip volatile evidence is tied to urgency, safety, or technical limitation rather than omission.
+- [ ] The containment method does not silently destroy volatile evidence without a documented decision.
+
+This gate is especially important in cloud and container environments where responders may terminate or replace workloads quickly and unintentionally destroy the only accessible memory and process evidence.
 
 #### 3a: Memory Acquisition
 
@@ -293,6 +312,24 @@ Preserve logs before rotation policies destroy them. Export and hash logs from e
 
 Cloud environments require different acquisition techniques because direct hardware access is not available.
 
+#### 6.1 Cloud Evidence Custody
+
+Provider-native snapshots and images are useful evidence, but they are not self-proving. A forensic review should capture who created the snapshot, which source resource it came from, what encryption context applies, whether the snapshot was copied or shared, and how analysts preserved read-only access.
+
+**Cloud evidence custody table:**
+
+| Provider | Source Resource ID | Snapshot / Image ID | Audit Event ID | KMS / Encryption Key | Sharing Status | Copy / Region Lineage | Analyst Access Mode | Read-Only Mount Proof |
+|----------|--------------------|---------------------|----------------|----------------------|----------------|-----------------------|---------------------|-----------------------|
+| AWS / Azure / GCP | [volume, disk, instance, image] | [snapshot id] | [CloudTrail / Activity Log / Audit Log event] | [CMK / platform key] | private / shared / unknown | [regions, copies, exports] | read-only / isolated copy | [command, screenshot, or notes] |
+
+**What to verify:**
+
+- [ ] The snapshot or image is mapped to the exact source disk, instance, or resource under investigation.
+- [ ] Provider audit logs identify who created, copied, shared, or deleted the evidence object.
+- [ ] Encryption context and key ownership are recorded so later access can be explained and reproduced.
+- [ ] Sharing state and cross-region copy lineage are captured because copies can change custody and exposure.
+- [ ] Analysis occurs from a read-only attachment or isolated copy, not by mounting the original evidence object read-write.
+
 **AWS:**
 ```
 # Create EBS volume snapshot (preserves disk state)
@@ -401,6 +438,11 @@ the order of collection, and any evidence that could not be obtained.]
 | Cloud Provider | Resource | Evidence Type | Collected | Notes |
 |---|---|---|---|---|
 | [AWS/Azure/GCP] | [Resource ID] | [Snapshot/Logs/Config] | [Yes/No] | [Notes] |
+
+### Cloud Evidence Custody (if applicable)
+| Provider | Source Resource ID | Snapshot / Image ID | Audit Event ID | KMS / Encryption Key | Sharing Status | Copy / Region Lineage | Access Mode |
+|---|---|---|---|---|---|---|---|
+| [AWS/Azure/GCP] | [Resource ID] | [Snapshot/Image ID] | [Event ID] | [Key] | [Private/Shared/Unknown] | [Lineage] | [Read-only/Isolated copy] |
 ```
 
 ---
@@ -457,7 +499,11 @@ Disk imaging on a live system can take hours. During that time, volatile evidenc
 
 Applying traditional forensic methods to cloud environments without adaptation leads to evidence gaps. EBS snapshots do not capture unallocated disk space. Serverless environments have no persistent disk. Cloud provider logs have limited retention periods and may not be enabled by default. VPC Flow Logs capture IP-level metadata, not packet content. Understand the evidence limitations of each cloud service and ensure logging is enabled before an incident occurs.
 
-### Pitfall 5: Overwriting Evidence with Collection Activity
+### Pitfall 5: Taking a Cloud Snapshot Without Recording Custody or Volatile-Evidence Decisions
+
+Creating a cloud snapshot is not enough. Without source-resource mapping, audit-event evidence, KMS context, sharing state, and copy lineage, the investigation cannot prove how the evidence object was created or whether it remained private and unchanged. The same problem occurs when responders terminate or replace a workload before recording whether memory, process state, or active network evidence was intentionally captured or waived.
+
+### Pitfall 6: Overwriting Evidence with Collection Activity
 
 Every action on a live system modifies it -- writing memory dump files to the evidence drive changes timestamps and consumes disk space, running commands updates shell history and modifies access times. Minimize evidence contamination by writing collection output to external media (USB, network share, S3 bucket), documenting every command executed on the system, and noting the expected impact of each collection action on the evidence state.
 
@@ -487,3 +533,10 @@ This skill processes forensic artifacts, log files, memory dumps, and system con
 8. **ACSC Digital Forensics Guide** -- https://www.cyber.gov.au/resources-business-and-government/essential-cyber-security/publications/digital-forensics
 9. **SWGDE Best Practices for Computer Forensics** -- https://www.swgde.org/documents
 10. **AWS Security Incident Response Guide** -- https://docs.aws.amazon.com/whitepapers/latest/aws-security-incident-response-guide/
+
+---
+
+## 10. Changelog
+
+- **1.0.1** -- Add a pre-containment volatile-evidence decision gate and cloud evidence custody tracking for snapshots, keys, sharing state, and copy lineage.
+- **1.0.0** -- Initial release.
