@@ -12,7 +12,7 @@ phase: [build, deploy]
 frameworks: [OWASP-Top-10-2021, OWASP-Testing-Guide-v4.2]
 difficulty: intermediate
 time_estimate: "30-60min"
-version: "1.0.0"
+version: "1.0.1"
 author: unitoneai
 license: MIT
 allowed-tools: Read, Grep, Glob
@@ -331,6 +331,75 @@ env:
 
 ---
 
+#### 4.2 Scan Intent, Role Coverage, and Tenant Coverage Matrix
+
+A configured login flow is not the same as meaningful authenticated coverage. Reviewers should distinguish unauthenticated smoke testing from authenticated security coverage, then verify whether the configured identities and fixtures exercise the roles, tenants, and route classes that matter for authorization testing.
+
+**Coverage matrix to require:**
+
+| Scan Intent | Auth Mechanism | Role / Persona | Tenant / Fixture | Route Group | Expected Coverage | Evidence |
+|-------------|----------------|----------------|------------------|-------------|-------------------|----------|
+| Unauthenticated smoke | none | public | n/a | health, login, pricing | uptime and passive coverage only | scan plan |
+| Authenticated security | browser / header / script | standard user | tenant-a | account, billing, profile | active + passive | AF plan + results |
+| Authenticated security | browser / header / script | support / ops | tenant-b | support actions, case views | active + passive | AF plan + results |
+| Authenticated security | browser / header / script | admin | test admin tenant | admin workflows | active + passive with exclusions | AF plan + exclusions |
+
+**What to verify:**
+
+- [ ] The review records whether a scan is `unauthenticated smoke`, `authenticated security`, or both.
+- [ ] The configured identities represent realistic low-privilege and privileged roles, not just a single admin account.
+- [ ] Tenant isolation testing uses at least two fixtures when tenant context affects responses or object access.
+- [ ] Route groups excluded from the scan are documented with justification and compensating manual testing.
+- [ ] Read-only roles that cannot reach mutation endpoints are recorded as an intentional coverage boundary, not as a generic auth failure.
+
+**Example gap to flag:**
+
+```yaml
+dast:
+  auth_script: login-admin.js
+  roles_tested: [admin]
+  roles_missing: [billing_admin, support_agent, read_only_customer]
+  tenant_fixtures: [tenant-a]
+```
+
+The example above proves authentication works, but it does not prove coverage for lower-privilege authorization paths, cross-tenant access checks, or workflows limited to customer roles.
+
+#### 4.3 State Isolation, Reset, and Destructive Action Guardrails
+
+Authenticated DAST can mutate application state. A safe review must capture how the target environment is seeded, how destructive workflows are isolated, and how the environment is reset between runs so results remain reproducible.
+
+**State management evidence to require:**
+
+| Control | What to Record | Example |
+|---------|----------------|---------|
+| Seeded fixtures | Test users, tenants, and baseline data created before the scan | `tenant-a`, `tenant-b`, seeded invoices |
+| Reset strategy | How the environment returns to baseline | database restore, API cleanup job, ephemeral redeploy |
+| Destructive guardrails | How dangerous actions are blocked or redirected | excluded delete routes, sandbox payment gateway |
+| Mutable workflow handling | How order creation, profile updates, or uploads are contained | isolated staging tenant, nightly teardown |
+| Retry and cleanup evidence | How failed scans or partial mutations are cleaned up | cleanup script output, redeploy log |
+
+**What to verify:**
+
+- [ ] Mutable endpoints run only against seeded test tenants or disposable environments.
+- [ ] A reset or cleanup mechanism exists for records created, modified, or deleted by the scanner.
+- [ ] The reset mechanism is documented closely enough that another reviewer could reproduce the same starting state.
+- [ ] Destructive routes that cannot be safely exercised are excluded with justification, not silently left in scope.
+- [ ] Shared staging environments record how scans avoid polluting other teams' data or exhausting shared accounts.
+
+**Example gap to flag:**
+
+```yaml
+scan_seed: shared-staging
+reset_strategy: none
+scanner_can_submit_orders: true
+```
+
+That configuration is not just noisy. It makes findings difficult to reproduce and can damage shared test environments.
+
+**Finding classification:** Missing role or tenant coverage for authenticated security testing is **High**. No state reset or cleanup evidence for mutable scans is **High**. Documented unauthenticated smoke testing used only for public routes is **Low** if the limitation is explicit.
+
+---
+
 ### Step 5: CI/CD DAST Integration
 
 #### 5.1 Pipeline Integration Patterns
@@ -482,8 +551,8 @@ DAST tools report findings per-URL, producing hundreds of duplicate alerts for t
 | Severity | Definition |
 |----------|-----------|
 | **Critical** | No authenticated scanning; active scanning targeting production; injection scan rules disabled; no scope restrictions. |
-| **High** | No DAST in CI/CD; no API scanning for API endpoints; active scanning disabled entirely; hardcoded credentials in config; destructive endpoints not excluded; authentication verification absent. |
-| **Medium** | No passive scanning on PRs; no scheduled full scan; OpenAPI spec out of date; no triage workflow; no deduplication; ZAP action unpinned; missing GraphQL scanning; missing security header rules. |
+| **High** | No DAST in CI/CD; no API scanning for API endpoints; active scanning disabled entirely; hardcoded credentials in config; destructive endpoints not excluded; authentication verification absent; no role/tenant coverage for authenticated security scans; no reset strategy for mutable scans. |
+| **Medium** | No passive scanning on PRs; no scheduled full scan; OpenAPI spec out of date; no triage workflow; no deduplication; ZAP action unpinned; missing GraphQL scanning; missing security header rules; exclusions without compensating manual coverage notes. |
 | **Low** | Suboptimal scan duration settings; cosmetic report formatting; non-critical passive rules disabled. |
 
 ---
@@ -514,6 +583,10 @@ DAST tools report findings per-URL, producing hundreds of duplicate alerts for t
 | Setting | Status | Evidence |
 |---------|--------|---------|
 | Authenticated scanning | Yes/No | <auth method> |
+| Scan intent classification | Smoke / Authenticated / Both | <plan or workflow> |
+| Role coverage matrix | Yes/No | <roles and route groups> |
+| Tenant / fixture coverage | Yes/No | <tenant-a, tenant-b, etc.> |
+| State reset / cleanup | Yes/No | <reset hook or redeploy evidence> |
 | Scope restrictions | Yes/No | <include/exclude paths> |
 | Passive scanning in CI | Yes/No | <workflow file> |
 | Active scanning (staging) | Yes/No | <workflow file> |
@@ -580,9 +653,13 @@ DAST tools report findings per-URL, producing hundreds of duplicate alerts for t
 
 3. **Not excluding destructive endpoints from scan scope.** ZAP's spider will follow every link and form action it finds. If a "Delete Account" or "Reset Database" endpoint is in scope, the scanner will exercise it. Explicitly exclude destructive paths in the scan context.
 
-4. **Treating DAST findings as ground truth without validation.** DAST tools have significant false positive rates, especially for injection findings. Every high-severity DAST finding must be manually validated before filing a remediation ticket. Build validation into the triage workflow.
+4. **Assuming one authenticated admin login proves coverage.** A single successful authenticated session can still miss low-privilege flows, cross-tenant authorization checks, or support-role behaviour. Record scan intent, role coverage, tenant fixtures, and route-group coverage explicitly.
 
-5. **Running only scheduled weekly scans instead of integrating into CI.** Weekly scans create a feedback loop measured in days. Passive baseline scans in CI (on every PR) give developers immediate feedback on security header regressions and configuration issues, while weekly full scans provide comprehensive active testing coverage.
+5. **Running mutable scans without a reset plan.** DAST against shared staging can create orders, uploads, tickets, or other records that poison later results. If there is no cleanup or redeploy strategy, the review should downgrade confidence instead of pretending the scan is repeatable.
+
+6. **Treating DAST findings as ground truth without validation.** DAST tools have significant false positive rates, especially for injection findings. Every high-severity DAST finding must be manually validated before filing a remediation ticket. Build validation into the triage workflow.
+
+7. **Running only scheduled weekly scans instead of integrating into CI.** Weekly scans create a feedback loop measured in days. Passive baseline scans in CI (on every PR) give developers immediate feedback on security header regressions and configuration issues, while weekly full scans provide comprehensive active testing coverage.
 
 ---
 
@@ -614,4 +691,5 @@ This skill processes DAST configuration files that may contain target URLs, auth
 
 ## Changelog
 
+- **1.0.1** -- Add scan-intent classification, role and tenant coverage matrix, and state reset / cleanup evidence for authenticated mutable scans.
 - **1.0.0** -- Initial release. Full coverage of DAST configuration review against OWASP Top 10:2021 and OWASP Testing Guide v4.2, with ZAP-specific patterns.
