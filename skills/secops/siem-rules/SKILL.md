@@ -12,7 +12,7 @@ phase: [operate]
 frameworks: [MITRE-ATT&CK-v16]
 difficulty: intermediate
 time_estimate: "20-40min"
-version: "1.0.0"
+version: "1.0.1"
 author: unitoneai
 license: MIT
 allowed-tools: Read, Grep, Glob
@@ -57,6 +57,9 @@ Before beginning, gather or confirm:
 - [ ] **Alert priority and response:** Desired severity level and expected analyst response procedure.
 - [ ] **Performance constraints:** Query time window, maximum execution time, and scheduled frequency.
 - [ ] **Existing rules:** Any current rules covering similar detections that may overlap or conflict.
+- [ ] **Trusted-network evidence:** Corporate VPN/SASE/proxy ranges, named locations, trusted ASNs/providers, and any approved identity egress points.
+- [ ] **Identity-type evidence:** Whether the rule targets human privileged users, break-glass accounts, service accounts, service principals, or managed identities.
+- [ ] **Enrichment dependencies:** Device/session fields, GeoIP source or confidence, watchlists/lookups, and any data freshness limits that affect tuning.
 
 ---
 
@@ -79,6 +82,27 @@ Select the appropriate detection logic pattern based on the threat being detecte
 | **Impossible travel** | Geographically implausible authentication | High |
 
 ### Step 2: Write the Detection Query
+
+#### Step 2a: Pre-Alert Enrichment Gates
+
+Before tuning thresholds, verify whether the rule depends on enrichment or context that separates real attacker behaviour from expected enterprise patterns.
+
+**Enrichment gates to record:**
+
+| Gate | Why it matters | Example evidence |
+|------|----------------|------------------|
+| Trusted egress / network ranges | Prevents impossible-travel or password-spray logic from flagging corporate VPN, SASE, proxy, or identity-provider egress | Sentinel watchlist, Splunk lookup, named location list |
+| ASN / provider context | Helps distinguish suspicious geography from the same managed provider footprint | ASN lookup, provider metadata, IP intelligence feed |
+| Device / session continuity | Reduces false positives when the user, session, and compliant device remain consistent | DeviceId, SessionId, Conditional Access result |
+| Identity type split | Prevents service accounts and managed identities from being treated like human privileged users | Identity inventory, account-type lookup, CMDB |
+| GeoIP confidence / source | Identifies location data that is too weak to support travel logic on its own | GeoIP provider, confidence field, enrichment timestamp |
+
+**What to verify:**
+
+- [ ] Impossible-travel detections document trusted network suppressions, named locations, and ASN/provider evidence before using raw geographic distance.
+- [ ] Off-hours privileged-account detections explicitly separate human privileged identities from service identities and managed workloads.
+- [ ] Detection logic records any lookup or watchlist freshness requirement that could stale out tuning assumptions.
+- [ ] If required enrichment is unavailable, the rule is downgraded in confidence or narrowed in scope rather than silently over-alerting.
 
 #### KQL (Microsoft Sentinel) Syntax Reference
 
@@ -160,15 +184,24 @@ SigninLogs
 let travel_speed_kmh = 900;  // Maximum plausible travel speed (commercial flight)
 let min_distance_km = 500;   // Minimum distance to flag (avoids VPN/proxy noise)
 let time_window = 24h;
+let TrustedEgress = datatable(IPAddress:string, Provider:string, Asn:int)
+[
+    "198.51.100.10", "Corporate SASE", 64512,
+    "203.0.113.20", "Corporate SASE", 64512
+];
 SigninLogs
 | where TimeGenerated > ago(time_window)
 | where ResultType == 0  // Successful logins only
 | where isnotempty(LocationDetails.geoCoordinates.latitude)
+| lookup kind=leftouter TrustedEgress on IPAddress
 | extend
     Latitude = todouble(LocationDetails.geoCoordinates.latitude),
     Longitude = todouble(LocationDetails.geoCoordinates.longitude),
     City = tostring(LocationDetails.city),
-    Country = tostring(LocationDetails.countryOrRegion)
+    Country = tostring(LocationDetails.countryOrRegion),
+    DeviceId = tostring(DeviceDetail.deviceId),
+    TrustedProvider = Provider,
+    TrustedAsn = Asn
 | sort by UserPrincipalName asc, TimeGenerated asc
 | serialize
 | extend
@@ -177,6 +210,8 @@ SigninLogs
     PrevTime = prev(TimeGenerated, 1),
     PrevCity = prev(City, 1),
     PrevCountry = prev(Country, 1),
+    PrevDeviceId = prev(DeviceId, 1),
+    PrevTrustedAsn = prev(TrustedAsn, 1),
     PrevUser = prev(UserPrincipalName, 1)
 | where UserPrincipalName == PrevUser
 | extend
@@ -187,8 +222,11 @@ SigninLogs
         cos(radians(PrevLatitude)) * cos(radians(Latitude)) *
         sin(radians((Longitude - PrevLongitude) / 2)) * sin(radians((Longitude - PrevLongitude) / 2))
     ))
+| extend SameTrustedEgress = isnotempty(TrustedProvider) and TrustedAsn == PrevTrustedAsn
+| extend SameDevice = isnotempty(DeviceId) and DeviceId == PrevDeviceId
 | where DistanceKm >= min_distance_km
 | extend RequiredSpeedKmh = iff(TimeDiffHours > 0, DistanceKm / TimeDiffHours, real(99999))
+| where not(SameTrustedEgress and SameDevice)
 | where RequiredSpeedKmh > travel_speed_kmh
 | project
     TimeGenerated,
@@ -198,7 +236,10 @@ SigninLogs
     TimeDiffHours = round(TimeDiffHours, 1),
     DistanceKm = round(DistanceKm, 0),
     RequiredSpeedKmh = round(RequiredSpeedKmh, 0),
-    IPAddress
+    IPAddress,
+    DeviceId,
+    TrustedProvider,
+    ConditionalAccessStatus
 ```
 
 ---
@@ -214,7 +255,6 @@ SigninLogs
 let business_start = 7;   // 7 AM
 let business_end = 19;    // 7 PM
 let weekend_days = dynamic(["Saturday", "Sunday"]);
-let privileged_patterns = dynamic(["admin", "svc-", "sa-", "break-glass", "emergency"]);
 SigninLogs
 | where TimeGenerated > ago(24h)
 | where ResultType == 0
@@ -229,10 +269,15 @@ SigninLogs
         dayofweek(TimeGenerated) == 4d, "Thursday",
         dayofweek(TimeGenerated) == 5d, "Friday",
         dayofweek(TimeGenerated) == 6d, "Saturday",
-        "Unknown")
+        "Unknown"),
+    IdentityType = case(
+        UserPrincipalName has "break-glass" or UserPrincipalName has "emergency", "human-privileged",
+        UserPrincipalName has "admin", "human-privileged",
+        UserPrincipalName has "svc-" or UserPrincipalName has "sa-", "service-account",
+        "other")
 | where HourOfDay < business_start or HourOfDay >= business_end
     or DayName in (weekend_days)
-| where UserPrincipalName has_any (privileged_patterns)
+| where IdentityType == "human-privileged"
 | project
     TimeGenerated,
     UserPrincipalName,
@@ -240,6 +285,7 @@ SigninLogs
     DayName,
     IPAddress,
     AppDisplayName,
+    IdentityType,
     LocationDetails.city,
     LocationDetails.countryOrRegion,
     ConditionalAccessStatus
@@ -298,6 +344,7 @@ index=wineventlog sourcetype="WinEventLog:Security" EventCode=4625
 `comment("Impossible Travel Detection -- ATT&CK T1078")`
 `comment("Detects logins from geographically distant locations within implausible time")`
 index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn
+| lookup trusted_egress_lookup ClientIP OUTPUT Provider as trusted_provider, Asn as trusted_asn
 | iplocation ClientIP
 | where isnotnull(lat) AND isnotnull(lon)
 | sort 0 UserId _time
@@ -307,7 +354,9 @@ index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn
     last(_time) as prev_time,
     last(City) as prev_city,
     last(Country) as prev_country,
-    last(ClientIP) as prev_ip
+    last(ClientIP) as prev_ip,
+    last(DeviceId) as prev_device_id,
+    last(trusted_asn) as prev_trusted_asn
     by UserId
 | where isnotnull(prev_lat)
 | eval time_diff_hours = (_time - prev_time) / 3600
@@ -316,13 +365,16 @@ index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn
     cos(prev_lat * pi() / 180) * cos(lat * pi() / 180) *
     pow(sin((lon - prev_lon) * pi() / 360), 2)
     ))
+| eval same_trusted_egress = if(isnotnull(trusted_provider) AND trusted_asn=prev_trusted_asn, 1, 0)
+| eval same_device = if(isnotnull(DeviceId) AND DeviceId=prev_device_id, 1, 0)
 | where distance_km >= 500
 | eval required_speed_kmh = if(time_diff_hours > 0, distance_km / time_diff_hours, 99999)
+| where NOT (same_trusted_egress=1 AND same_device=1)
 | where required_speed_kmh > 900
 | eval current_location = City . ", " . Country
 | eval previous_location = prev_city . ", " . prev_country
 | table _time, UserId, current_location, previous_location,
-    time_diff_hours, distance_km, required_speed_kmh, ClientIP, prev_ip
+    time_diff_hours, distance_km, required_speed_kmh, ClientIP, prev_ip, DeviceId, trusted_provider
 ```
 
 ---
@@ -335,7 +387,8 @@ index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn
 `comment("Privileged Account Off-Hours Logon -- ATT&CK T1078.002")`
 `comment("Detects privileged account logins outside business hours")`
 index=wineventlog sourcetype="WinEventLog:Security" EventCode=4624
-    (TargetUserName="admin*" OR TargetUserName="svc-*" OR TargetUserName="sa-*")
+| lookup identity_inventory_lookup account as TargetUserName OUTPUT identity_type, privilege_tier
+| where identity_type="human-privileged" OR identity_type="break-glass"
 | eval hour = strftime(_time, "%H")
 | eval day_of_week = strftime(_time, "%A")
 | where (hour < 7 OR hour >= 19)
@@ -344,6 +397,7 @@ index=wineventlog sourcetype="WinEventLog:Security" EventCode=4624
     count as logon_count,
     values(IpAddress) as source_ips,
     values(WorkstationName) as workstations,
+    values(identity_type) as identity_types,
     earliest(_time) as first_seen,
     latest(_time) as last_seen
     by TargetUserName, LogonType
@@ -362,7 +416,7 @@ index=wineventlog sourcetype="WinEventLog:Security" EventCode=4624
     true(), "Unknown"
     )
 | sort - logon_count
-| table TargetUserName, logon_type_desc, logon_count, source_ips, workstations, first_seen, last_seen
+| table TargetUserName, identity_types, logon_type_desc, logon_count, source_ips, workstations, first_seen, last_seen
 ```
 
 ---
@@ -509,7 +563,7 @@ Produce SIEM rule deliverables in this structure:
 ```markdown
 ## SIEM Detection Rule: [Rule Name]
 **Date:** [YYYY-MM-DD]
-**Skill:** siem-rules v1.0.0
+**Skill:** siem-rules v1.0.1
 **Framework:** MITRE ATT&CK v16
 **Platform:** [Microsoft Sentinel (KQL) | Splunk (SPL)]
 
@@ -540,9 +594,19 @@ Produce SIEM rule deliverables in this structure:
 | Account | [UserPrincipalName / TargetUserName] |
 | IP | [IPAddress / IpAddress] |
 | Host | [Computer / ComputerName] |
+| Device / Session | [DeviceId / SessionId / WorkstationName] |
+| Identity Type | [identity_type / privilege_tier] |
 
 ### Known False Positives
 - [List specific FP sources]
+
+### Enrichment and Trust Context
+| Dependency | Source | Freshness | Evidence |
+|------------|--------|-----------|----------|
+| Trusted egress / named locations | [watchlist / lookup / CA named locations] | [daily / weekly / ad hoc] | [provider / ASN / network owner] |
+| Identity inventory | [CMDB / IAM export / lookup] | [daily / weekly / ad hoc] | [human privileged / service / managed identity split] |
+| Device / session continuity | [EDR / IdP / endpoint table] | [near-real-time / delayed] | [DeviceId, SessionId, compliance state] |
+| GeoIP source | [provider / feed] | [timestamp] | [confidence / known limitations] |
 
 ### Tuning Guidance
 - [Specific tuning recommendations]
@@ -632,6 +696,14 @@ Deploying a rule without confirming it fires on known-malicious activity is depl
 
 A detection rule that fires every 5 minutes on the same ongoing activity (e.g., a brute force attack lasting 2 hours) floods the alert queue with duplicates. Configure alert suppression or deduplication to prevent the same incident from generating hundreds of identical alerts. Use suppression windows and entity-based grouping to consolidate related alerts.
 
+### Pitfall 6: Treating Trusted Egress as Suspicious Geography
+
+Impossible-travel logic built only on GeoIP distance and elapsed time will over-alert in environments that use SASE, VPN, identity-provider egress, mobile carrier NAT, or global proxy infrastructure. Require trusted-network, ASN/provider, and device/session continuity evidence before escalating geographic anomalies as account compromise.
+
+### Pitfall 7: Treating Service Identities Like Human Privileged Users
+
+Rules that match `svc-*`, `sa-*`, managed identities, or service principals as if they were human administrators generate noise and hide the real signal. Split human privileged identities, break-glass accounts, service accounts, and workload identities before applying off-hours thresholds or analyst response expectations.
+
 ---
 
 ## 8. Prompt Injection Safety Notice
@@ -658,3 +730,10 @@ This skill processes user-supplied content that may include SIEM query drafts, l
 8. **MITRE ATT&CK Data Sources** -- https://attack.mitre.org/datasources/
 9. **Sentinel Entity Mapping** -- https://learn.microsoft.com/en-us/azure/sentinel/map-data-fields-to-entities
 10. **Splunk CIM (Common Information Model)** -- https://docs.splunk.com/Documentation/CIM/latest/User/Overview
+
+---
+
+## 10. Changelog
+
+- **1.0.1** -- Add pre-alert enrichment gates, trusted-egress and device/session suppression for impossible-travel guidance, identity-type splitting for privileged off-hours detections, and output-schema fields for trust context.
+- **1.0.0** -- Initial release.
